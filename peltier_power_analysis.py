@@ -1,191 +1,293 @@
 """
-Peltier Power Analysis Tool
-============================
-Interactive plot: Surface Area (m²) vs Electrical Power Output (W)
-for a round 12mm-diameter Peltier module with water flowing past it,
-either directly or through a copper pipe of adjustable wall thickness.
+Peltier Power Analysis — Single Interactive Graph
+==================================================
+One graph comparing:
+  - Horizontal line: 10mm square Peltier with direct water contact
+  - Three curves vs. metal block thickness:
+      Copper (400 W/m·K)
+      Lead-free brass (109 W/m·K)
+      Conductive plastic (20 W/m·K)
 
-All units are SI.
-
-Assumptions / Model Summary
-----------------------------
-- Round Peltier module: 12 mm diameter  →  actual area ≈ π*(0.006)² ≈ 1.13e-4 m²
-- Thermal resistance network (both the hot-side and cold-side resistances are
-  assumed identical and symmetric):
-    R_total = 2*R_conv + 2*R_cond + R_p
-- Convection coefficient (simplified Dittus-Boelter-like):
-    h = 3000 * b**0.8   [W/(m²·K)]
-- Pipe diameter assumed 3/4 inch (0.01905 m) for flow reference
-- Max electrical power at matched-load condition:
-    P = (S * ΔT_peltier)² / (4 * R_i)
-
-Sliders
--------
-  a  Copper pipe wall thickness (m),  0 → 0.01   default 0.002
-       a = 0 means direct water contact (no pipe)
-  b  Water flow speed (m/s),          0.1 → 5.0  default 1.5
-  c  Temperature difference ΔT (°C), 5 → 100    default 40
-
-Constants
----------
-  k_cu = 400   W/(m·K)   – copper thermal conductivity (high purity, best case)
-  k_p  = 1.5   W/(m·K)   – Peltier module thermal conductivity
-  d_p  = 0.003 m          – Peltier thickness (3 mm)
-  S    = 0.04  V/K        – Seebeck coefficient
-  R_i  = 2.5   Ω          – internal electrical resistance
+Sliders for hot water temperature and block width.
 """
 
 import numpy as np
 import matplotlib.pyplot as plt
-import matplotlib.widgets as widgets
+from matplotlib.widgets import Button, TextBox, Slider
 
-# ---------------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────
+# Water properties at ~30°C
+# ──────────────────────────────────────────────────────────────────────
+RHO_W  = 994.0
+MU_W   = 0.72e-3
+K_W    = 0.623
+PR_W   = 4.8
+NU_W   = MU_W / RHO_W
+
+# ──────────────────────────────────────────────────────────────────────
 # Constants
-# ---------------------------------------------------------------------------
-k_cu = 400      # W/(m·K)  — copper thermal conductivity (high purity)
-k_p  = 1.5      # W/(m·K)  — Peltier module thermal conductivity
-d_p  = 0.003    # m         — Peltier ceramic thickness
-S    = 0.04     # V/K       — Seebeck coefficient
-R_i  = 2.5      # Ω         — internal electrical resistance
+# ──────────────────────────────────────────────────────────────────────
+T_COLD       = 10.0      # °C  cold water (≈50°F), fixed
+T_AMB        = 25.0      # °C  ambient air
+PELTIER_SIDE = 0.010     # m   10mm square
+FLOW         = 1.0       # m/s
+H_AIR        = 10.0      # W/(m²·K)
+S            = 0.029     # V/K
+R_I          = 2.5       # Ω
+K_PASTE      = 4.0       # W/(m·K)
+D_PASTE      = 0.0001    # m
+K_P          = 1.5       # W/(m·K)
+D_P          = 0.003     # m
 
-# Reference surface area of the 12 mm-diameter round module
-r_module = 0.006                     # radius = 6 mm
-A_module = np.pi * r_module**2       # ≈ 1.131e-4 m²
+MATERIALS = [
+    ('Copper (400 W/m·K)',          400, '#B87333', '-',  2.8),
+    ('Lead-free brass (109 W/m·K)', 109, '#C9B037', '--', 2.8),
+    ('Conductive plastic (20 W/m·K)', 20, '#2E8B57', ':', 2.8),
+]
 
-# ---------------------------------------------------------------------------
-# Slider defaults
-# ---------------------------------------------------------------------------
-a_default = 0.002   # m  — copper wall thickness
-b_default = 1.5     # m/s — flow speed
-c_default = 40.0    # °C  — ΔT
+# ──────────────────────────────────────────────────────────────────────
+# Defaults
+# ──────────────────────────────────────────────────────────────────────
+DEFAULT_T_HOT     = 60.0    # °C
+DEFAULT_CUBE_SIDE = 10.0    # mm
 
-# ---------------------------------------------------------------------------
-# Surface-area sweep (x-axis)
-# ---------------------------------------------------------------------------
-x = np.linspace(1e-4, 0.02, 500)    # m²  (0.0001 → 0.02)
+state = dict(T_hot=DEFAULT_T_HOT, cube_side_mm=DEFAULT_CUBE_SIDE)
 
-# ---------------------------------------------------------------------------
-# Core calculation function
-# ---------------------------------------------------------------------------
-def compute_power(x, a, b, c):
-    """
-    Given:
-        x  – surface area array (m²)
-        a  – copper pipe wall thickness (m);  0 = direct contact
-        b  – water flow speed (m/s)
-        c  – bulk ΔT (°C) between hot and cold water streams
+# ──────────────────────────────────────────────────────────────────────
+# X-axis (generous, trimmed at draw time)
+# ──────────────────────────────────────────────────────────────────────
+A_MM_MAX   = 500
+a_mm_full  = np.linspace(0.5, A_MM_MAX, 2000)
+a_m_full   = a_mm_full / 1000
 
-    Returns:
-        y  – electrical power output array (W)
-    """
-    # Conduction resistance through copper pipe wall [K/W]
-    # Edge case: a=0 → direct contact → R_cond = 0 (no copper layer)
-    if a == 0:
-        R_cond = np.zeros_like(x)
+# ──────────────────────────────────────────────────────────────────────
+# Physics
+# ──────────────────────────────────────────────────────────────────────
+def h_flat_plate(v, L):
+    Re = v * L / NU_W
+    if Re > 5e5:
+        Nu = 0.037 * Re**0.8 * PR_W**(1/3)
     else:
-        R_cond = a / (k_cu * x)
+        Nu = 0.664 * Re**0.5 * PR_W**(1/3)
+    return Nu * K_W / L
 
-    # Convective heat transfer coefficient [W/(m²·K)] — simplified correlation
-    h = 3000 * b**0.8
+def direct_water_power(T_hot):
+    dT = T_hot - T_COLD
+    h = h_flat_plate(FLOW, PELTIER_SIDE)
+    r_conv = 1.0 / h
+    r_pelt = D_P / K_P
+    r_total = 2 * r_conv + r_pelt
+    dT_pelt = dT * (r_pelt / r_total)
+    return (S * dT_pelt)**2 / (4 * R_I) * 1000
 
-    # Convection thermal resistance [K/W]
-    R_conv = 1 / (h * x)
+def block_power(a_m, T_hot, cube_side):
+    A_block = cube_side ** 2
+    A_pelt  = PELTIER_SIDE ** 2
+    P_perim = 4 * cube_side
 
-    # Peltier ceramic conduction resistance [K/W]
-    R_p = d_p / (k_p * x)
+    R_paste_pipe = D_PASTE / (K_PASTE * A_block)
+    R_paste_pelt = D_PASTE / (K_PASTE * A_pelt)
+    R_pelt       = D_P / (K_P * A_pelt)
+    R_mid  = 2 * R_paste_pipe + 2 * R_paste_pelt + R_pelt
+    frac_p = R_pelt / R_mid
 
-    # Total thermal resistance (both sides: convection + conduction + Peltier)
-    R_total = 2 * R_conv + 2 * R_cond + R_p
+    out = {}
+    for name, k_mat, color, ls, lw in MATERIALS:
+        m = np.sqrt(H_AIR * P_perim / (k_mat * A_block))
+        ma = m * a_m
+        cosh_ma = np.where(ma < 700, np.cosh(ma), np.exp(ma) / 2)
 
-    # Temperature difference actually across the Peltier module [K]
-    D_p = c * (R_p / R_total)
+        T_hot_tip  = T_AMB + (T_hot  - T_AMB) / cosh_ma
+        T_cold_tip = T_AMB + (T_COLD - T_AMB) / cosh_ma
 
-    # Max electrical power at matched-load condition [W]
-    y = (S * D_p)**2 / (4 * R_i)
+        dT_tips = T_hot_tip - T_cold_tip
+        dT_pelt = np.maximum(dT_tips * frac_p, 0)
+        P_mW = (S * dT_pelt)**2 / (4 * R_I) * 1000
 
-    return y
+        out[name] = dict(P_mW=P_mW, color=color, ls=ls, lw=lw)
+    return out
 
-# ---------------------------------------------------------------------------
-# Console summary of assumptions
-# ---------------------------------------------------------------------------
-print("=" * 60)
-print("  Peltier Power Analysis — Assumptions & Model Summary")
-print("=" * 60)
-print(f"  Module diameter : 12 mm  (radius = 6 mm)")
-print(f"  Module area     : {A_module:.4e} m²")
-print(f"  Peltier thickness (d_p) : {d_p*1000:.1f} mm")
-print(f"  Seebeck coeff   (S)     : {S} V/K")
-print(f"  Internal resist (R_i)   : {R_i} Ω")
-print(f"  Copper k (k_cu) : {k_cu} W/(m·K)  [high-purity, best-case]")
-print(f"  Peltier k (k_p) : {k_p} W/(m·K)")
-print(f"  Pipe diameter   : 3/4 inch (0.01905 m)  [flow ref only]")
-print()
-print("  Thermal model:  R_total = 2·R_conv + 2·R_cond + R_p")
-print("  Convection:     h = 3000 · b^0.8  [simplified Dittus-Boelter]")
-print("  Power:          P = (S·ΔT_peltier)² / (4·R_i)  [matched load]")
-print()
-print("  Sliders:  a = pipe wall thickness (0 = direct contact)")
-print("            b = water flow speed")
-print("            c = bulk temperature difference ΔT")
-print("=" * 60)
+def find_crossover(P_mW, P_water, a_mm):
+    diff = P_mW - P_water
+    cross_idx = np.where(np.diff(np.sign(diff)))[0]
+    if len(cross_idx) > 0:
+        i = cross_idx[0]
+        return a_mm[i] + (a_mm[i+1]-a_mm[i]) * (-diff[i]) / (diff[i+1]-diff[i])
+    return None
 
-# ---------------------------------------------------------------------------
-# Build the initial figure
-# ---------------------------------------------------------------------------
-fig, ax = plt.subplots(figsize=(9, 6))
-plt.subplots_adjust(left=0.10, bottom=0.32, right=0.97, top=0.88)
+# ──────────────────────────────────────────────────────────────────────
+# Figure
+# ──────────────────────────────────────────────────────────────────────
+fig = plt.figure(figsize=(11, 7.5))
+fig.patch.set_facecolor('#fafafa')
+fig._refs = []
 
-y_init = compute_power(x, a_default, b_default, c_default)
-[line] = ax.plot(x, y_init, color="steelblue", linewidth=2)
+ax = fig.add_axes([0.08, 0.22, 0.88, 0.68])
 
-# Vertical dashed reference line at the actual module area
-ax.axvline(A_module, color="tomato", linestyle="--", linewidth=1.4,
-           label=f"12 mm module  (A ≈ {A_module:.2e} m²)")
-ax.legend(loc="upper left", fontsize=9)
+def draw():
+    ax.clear()
 
-ax.set_xlabel("Surface Area (m²)", fontsize=12)
-ax.set_ylabel("Power Output (W)", fontsize=12)
-ax.set_xlim(x[0], x[-1])
-ax.set_ylim(bottom=0)
-ax.grid(True, alpha=0.3)
+    T_hot     = state['T_hot']
+    cube_side = state['cube_side_mm'] / 1000
+    dT        = T_hot - T_COLD
 
-def make_title(a, b, c):
-    contact = "direct contact" if a == 0 else f"wall = {a*1000:.2f} mm"
-    return (f"Peltier Power Output   |   "
-            f"{contact},  flow = {b:.2f} m/s,  ΔT = {c:.0f} °C")
+    P_water = direct_water_power(T_hot)
+    bres    = block_power(a_m_full, T_hot, cube_side)
 
-ax.set_title(make_title(a_default, b_default, c_default), fontsize=11)
+    # Find x-limit from all crossovers
+    crossovers = []
+    for name, mdata in bres.items():
+        ac = find_crossover(mdata['P_mW'], P_water, a_mm_full)
+        if ac is not None:
+            crossovers.append(ac)
 
-# ---------------------------------------------------------------------------
-# Sliders
-# ---------------------------------------------------------------------------
-ax_slider_a = plt.axes([0.12, 0.20, 0.76, 0.03])
-ax_slider_b = plt.axes([0.12, 0.13, 0.76, 0.03])
-ax_slider_c = plt.axes([0.12, 0.06, 0.76, 0.03])
+    if len(crossovers) > 0:
+        x_max = max(crossovers) * 1.25
+    else:
+        x_max = A_MM_MAX
+    x_max = max(min(x_max, A_MM_MAX), 20)
 
-slider_a = widgets.Slider(ax_slider_a, "a  wall (m)",  0.0,  0.01,  valinit=a_default, valstep=0.0001)
-slider_b = widgets.Slider(ax_slider_b, "b  flow (m/s)", 0.1,  5.0,  valinit=b_default)
-slider_c = widgets.Slider(ax_slider_c, "c  ΔT (°C)",    5.0, 100.0, valinit=c_default)
+    mask = a_mm_full <= x_max
+    a_plot = a_mm_full[mask]
 
-# ---------------------------------------------------------------------------
-# Update callback
-# ---------------------------------------------------------------------------
-def update(_):
-    a = slider_a.val
-    b = slider_b.val
-    c = slider_c.val
+    # Direct water line
+    ax.axhline(P_water, color='forestgreen', linewidth=2.5, linestyle='--',
+               label=f'Direct water contact ({P_water:.3f} mW)', zorder=3)
 
-    y_new = compute_power(x, a, b, c)
-    line.set_ydata(y_new)
+    # Material curves + crossover markers
+    for name, mdata in bres.items():
+        P_plot = mdata['P_mW'][mask]
+        ax.plot(a_plot, P_plot, color=mdata['color'],
+                linestyle=mdata['ls'], linewidth=mdata['lw'], label=name)
 
-    # Rescale y-axis to fit new data
-    ax.set_ylim(0, max(y_new.max() * 1.15, 1e-6))
+        ac = find_crossover(mdata['P_mW'], P_water, a_mm_full)
+        if ac is not None and ac <= x_max:
+            ax.plot(ac, P_water, 'o', color=mdata['color'], markersize=10,
+                    zorder=5, markeredgecolor='black', markeredgewidth=1)
+            ax.annotate(f'{ac:.1f} mm',
+                        xy=(ac, P_water),
+                        xytext=(ac + x_max * 0.03, P_water * 0.75),
+                        fontsize=9, color=mdata['color'], fontweight='bold',
+                        arrowprops=dict(arrowstyle='->', color=mdata['color'],
+                                        lw=1.2))
 
-    ax.set_title(make_title(a, b, c), fontsize=11)
+    cube_label = (f"{state['cube_side_mm']:.0f}×{state['cube_side_mm']:.0f}mm block"
+                  if state['cube_side_mm'] != 10
+                  else "10×10mm block (= Peltier size)")
+
+    ax.set_title(
+        f"ΔT = {dT:.0f}°C  (hot {T_hot:.0f}°C − cold {T_COLD:.0f}°C)     "
+        f"{cube_label}     ● = crossover",
+        fontsize=12, fontweight='bold')
+
+    ax.set_xlabel('Metal block thickness per side (mm)', fontsize=11)
+    ax.set_ylabel('Power output (mW)', fontsize=11)
+    ax.set_xlim(a_plot[0], x_max)
+    ax.set_ylim(bottom=0)
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc='lower right', fontsize=9,
+              framealpha=0.9, edgecolor='gray')
+
     fig.canvas.draw_idle()
 
-slider_a.on_changed(update)
-slider_b.on_changed(update)
-slider_c.on_changed(update)
+draw()
+
+# ──────────────────────────────────────────────────────────────────────
+# Controls
+# ──────────────────────────────────────────────────────────────────────
+
+# Hot water temperature slider
+ax_temp = fig.add_axes([0.08, 0.10, 0.55, 0.03])
+slider_temp = Slider(ax_temp, 'Hot water (°C)', 20.0, 100.0,
+                      valinit=DEFAULT_T_HOT, valstep=1.0,
+                      color='tomato')
+
+# Block width: label + box + nudge buttons
+fig.text(0.08, 0.045, 'Block width (mm):', fontsize=10,
+         fontweight='bold', ha='left', va='center')
+
+ax_box = fig.add_axes([0.24, 0.03, 0.07, 0.035])
+tb_cube = TextBox(ax_box, '', initial=f'{DEFAULT_CUBE_SIDE:.0f}')
+
+fig.text(0.315, 0.045, 'mm', fontsize=10, ha='left', va='center')
+
+ax_dn = fig.add_axes([0.32, 0.03, 0.035, 0.035])
+ax_up = fig.add_axes([0.36, 0.03, 0.035, 0.035])
+btn_dn = Button(ax_dn, '−', color='#ffe0e0', hovercolor='#ffb0b0')
+btn_up = Button(ax_up, '+', color='#e0ffe0', hovercolor='#b0ffb0')
+btn_dn.label.set_fontsize(12)
+btn_dn.label.set_fontweight('bold')
+btn_up.label.set_fontsize(12)
+btn_up.label.set_fontweight('bold')
+
+# Reset button
+ax_reset = fig.add_axes([0.85, 0.03, 0.08, 0.035])
+btn_reset = Button(ax_reset, 'Reset', color='lightgray', hovercolor='silver')
+btn_reset.label.set_fontsize(10)
+btn_reset.label.set_fontweight('bold')
+
+# Info line
+info = (
+    f"Peltier: 10×10mm, {D_P*1000:.0f}mm, S={S} V/K, Rᵢ={R_I}Ω  |  "
+    f"Paste: {D_PASTE*1000:.1f}mm @ {K_PASTE} W/m·K  |  "
+    f"Cold water: {T_COLD}°C  |  Water flow: {FLOW} m/s  |  "
+    f"Ambient: {T_AMB}°C  h_air={H_AIR} W/m²·K"
+)
+fig.text(0.5, 0.005, info, ha='center', fontsize=7, family='monospace',
+         alpha=0.45)
+
+# ──────────────────────────────────────────────────────────────────────
+# Callbacks
+# ──────────────────────────────────────────────────────────────────────
+def on_temp_change(val):
+    state['T_hot'] = val
+    draw()
+
+slider_temp.on_changed(on_temp_change)
+
+def update_cube(new_val):
+    new_val = max(new_val, PELTIER_SIDE * 1000)
+    state['cube_side_mm'] = round(new_val, 1)
+    tb_cube.set_val(f"{state['cube_side_mm']:.0f}")
+    draw()
+
+def on_cube_submit(text):
+    try:
+        update_cube(float(text))
+    except ValueError:
+        tb_cube.set_val(f"{state['cube_side_mm']:.0f}")
+
+tb_cube.on_submit(on_cube_submit)
+
+def on_dn(event):
+    update_cube(state['cube_side_mm'] - 1)
+
+def on_up(event):
+    update_cube(state['cube_side_mm'] + 1)
+
+btn_dn.on_clicked(on_dn)
+btn_up.on_clicked(on_up)
+
+def on_reset(event):
+    state['T_hot'] = DEFAULT_T_HOT
+    state['cube_side_mm'] = DEFAULT_CUBE_SIDE
+    slider_temp.set_val(DEFAULT_T_HOT)
+    tb_cube.set_val(f"{DEFAULT_CUBE_SIDE:.0f}")
+    draw()
+
+btn_reset.on_clicked(on_reset)
+
+fig._refs = [slider_temp, tb_cube, btn_dn, btn_up, btn_reset]
+
+# ──────────────────────────────────────────────────────────────────────
+# Console
+# ──────────────────────────────────────────────────────────────────────
+print("=" * 65)
+print("  Peltier Power: Block on Pipe vs. Direct Water Contact")
+print("=" * 65)
+print("  Slide hot water temp to see ΔT effect in real time")
+print("  Adjust block width to see thermal mass effect")
+print("  ● = thickness where block becomes worse than water contact")
+print("=" * 65)
 
 plt.show()
